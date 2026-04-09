@@ -140,7 +140,7 @@ microphone:
     i2s_din_pin: GPIO6     # SD/DOUT  - free GPIO, adjust to match your wiring
     i2s_audio_id: i2s_in
     sample_rate: 48000
-    bits_per_channel: 16bit
+    bits_per_channel: 32bit
     bits_per_sample: 16bit
     channel: left
     pdm: false
