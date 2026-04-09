@@ -18,8 +18,11 @@ Raspberry Pi (BirdNET-Pi)
 ```
 
 **Audio format sent over UDP:** 16-bit signed PCM, little-endian, mono, 48000 Hz.  
-The ICS-43434 outputs stereo I2S with both channels identical — the ESP32 extracts
-the left channel only before sending, halving bandwidth from ~1.5 Mbps to ~768 kbps.
+The ICS-43434 outputs 24-bit data in one channel of a standard stereo I2S frame
+(selected by the LR pin — tied low for left). ESPHome's `on_data` callback delivers
+this as stereo interleaved 16-bit LE bytes (both channels identical). The ESP32
+lambda extracts the left channel only before sending, halving bandwidth from
+~1.5 Mbps to ~768 kbps.
 
 ---
 

@@ -183,12 +183,15 @@ microphone:
           dest.sin_port = htons((uint16_t)port);
           if (::inet_pton(AF_INET, ip.c_str(), &dest.sin_addr) != 1) return;
 
-          // Extract left channel only (stereo interleaved: L, R, L, R...)
-          std::vector<int16_t> mono;
+          // x is stereo interleaved 16-bit LE PCM bytes (L_lo, L_hi, R_lo, R_hi, ...).
+          // Extract left channel only — copy 2 bytes per frame, skip 4.
+          size_t frame_bytes = 4;  // 2 channels * 2 bytes per sample
+          std::vector<uint8_t> mono;
           mono.reserve(x.size() / 2);
-          for (size_t i = 0; i < x.size(); i += 2) {
-            mono.push_back(x[i]);
+          for (size_t i = 0; i + 1 < x.size(); i += frame_bytes) {
+            mono.push_back(x[i]);      // L low byte
+            mono.push_back(x[i + 1]);  // L high byte
           }
 
-          ::sendto(sock, mono.data(), mono.size() * sizeof(int16_t), 0,
+          ::sendto(sock, mono.data(), mono.size(), 0,
                    (struct sockaddr*)&dest, sizeof(dest));
