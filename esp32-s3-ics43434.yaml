@@ -38,6 +38,7 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  power_save_mode: none
   on_connect:
     - logger.log: "WiFi connected!"
     - logger.log: "Starting microphone capture"
@@ -185,13 +186,17 @@ microphone:
 
           // x is stereo interleaved 16-bit LE PCM bytes (L_lo, L_hi, R_lo, R_hi, ...).
           // Extract left channel only — copy 2 bytes per frame, skip 4.
+          static std::vector<uint8_t> mono;  // static to avoid heap alloc per callback
+          mono.clear();
           size_t frame_bytes = 4;  // 2 channels * 2 bytes per sample
-          std::vector<uint8_t> mono;
-          mono.reserve(x.size() / 2);
-          for (size_t i = 0; i + 1 < x.size(); i += frame_bytes) {
+          size_t out_size = (x.size() / frame_bytes) * 2;
+          if (mono.capacity() < out_size) mono.reserve(out_size);
+          for (size_t i = 0; i + 3 < x.size(); i += frame_bytes) {
             mono.push_back(x[i]);      // L low byte
             mono.push_back(x[i + 1]);  // L high byte
           }
 
-          ::sendto(sock, mono.data(), mono.size(), 0,
+          // MSG_DONTWAIT: don't block if WiFi TX buffer is full — drop
+          // the packet rather than stalling I2S processing.
+          ::sendto(sock, mono.data(), mono.size(), MSG_DONTWAIT,
                    (struct sockaddr*)&dest, sizeof(dest));
