@@ -5,7 +5,6 @@ substitutions:
   #variant: esp32s3
   wifi_ssid: !secret wifi_ssid
   wifi_password: !secret wifi_password
-  ota_password: !secret ota_password
 
 packages:
   remote_package:
