@@ -9,20 +9,32 @@ BirdNET-Pi, via raw UDP over the local network.
 
 ```
 ICS-43434 mic
-     │ I2S (stereo hardware, left channel used)
+     │ I2S (32-bit slots, left channel, 24kHz effective)
 ESP32-S3 Zero
-     │ raw mono PCM UDP (port 5000)
+     │ raw stereo PCM UDP (port 5000)
      ▼
 Raspberry Pi (BirdNET-Pi)
-  ffmpeg → ALSA Loopback → BirdNET-Pi recording service
+  ffmpeg (24kHz→48kHz upsample) → ALSA Loopback → BirdNET-Pi recording service
 ```
 
-**Audio format sent over UDP:** 16-bit signed PCM, little-endian, mono, 48000 Hz.  
-The ICS-43434 outputs 24-bit data in one channel of a standard stereo I2S frame
-(selected by the LR pin — tied low for left). ESPHome's `on_data` callback delivers
-this as stereo interleaved 16-bit LE bytes (both channels identical). The ESP32
-lambda extracts the left channel only before sending, halving bandwidth from
-~1.5 Mbps to ~768 kbps.
+**Audio format sent over UDP:** 16-bit signed PCM, little-endian, stereo, ~24 kHz.
+
+The ICS-43434 outputs 24-bit data in the left slot of a standard stereo I2S frame
+(LR pin tied low). ESPHome's `on_data` callback delivers stereo interleaved 16-bit
+LE bytes (both channels identical). The raw stereo data is sent directly over UDP
+with no processing on the ESP32 to keep the I2S callback as fast as possible.
+ffmpeg on the Pi handles upsampling to 48 kHz for BirdNET.
+
+**Why 24 kHz?** The ICS-43434 requires 64 SCK cycles per WS frame (32-bit channel
+slots). Setting `bits_per_channel: 32bit` in ESPHome satisfies this requirement and
+eliminates I2S framing clicks, but halves the effective sample rate from 48 kHz to
+24 kHz at the current SCK frequency. 24 kHz is sufficient for BirdNET — bird calls
+are well below the 12 kHz Nyquist limit.
+
+**Why stereo?** Extracting mono on the ESP32 adds processing time to the
+time-critical I2S DMA callback and can cause audio glitches. Sending raw stereo
+and letting ffmpeg handle it on the Pi (which has CPU to spare) produces cleaner
+audio. The bandwidth cost (~1.5 Mbps) is trivial for local WiFi.
 
 ---
 
@@ -38,9 +50,24 @@ Key microphone settings: see [esp32-s3-ics43434.yaml](esp32-s3-ics43434.yaml)
 | BCLK (SCK) | GPIO4 |
 | DIN (SD)   | GPIO6 |
 
+**Key I2S settings:**
+
+| Setting            | Value | Why                                                        |
+|--------------------|-------|------------------------------------------------------------|
+| `sample_rate`      | 48000 | ESPHome I2S clock base rate                                |
+| `bits_per_channel` | 32bit | Matches ICS-43434 requirement of 64 SCK/frame              |
+| `bits_per_sample`  | 16bit | Truncates 24-bit mic data to 16-bit (sufficient for birds) |
+| `channel`          | left  | ICS-43434 LR pin tied low                                  |
+| `use_apll`         | true  | Audio PLL for accurate clock generation                    |
+| `power_save_mode`  | none  | Disables WiFi power save to reduce UDP jitter              |
+
 The UDP target IP and port are configurable at runtime via Home Assistant
 (`Audio Target IP` and `UDP Target Port` entities). The microphone starts
 and stops automatically with WiFi connection state.
+
+UDP packets are split into chunks of 1400 bytes or less to avoid IP
+fragmentation (MTU 1500). `MSG_DONTWAIT` is used on `sendto()` to prevent
+the WiFi TX buffer from blocking the I2S callback.
 
 ---
 
@@ -70,7 +97,20 @@ aplay -l | grep -i loopback
 
 ---
 
-### 2. Create the systemd Service
+### 2. Disable WiFi Power Management
+
+WiFi power save causes severe packet jitter (100ms+ gaps followed by bursts).
+Disable it and make it persistent:
+
+```bash
+sudo iwconfig wlan0 power off
+# Persist across reboots:
+(sudo crontab -l 2>/dev/null; echo "@reboot /sbin/iwconfig wlan0 power off") | sudo crontab -
+```
+
+---
+
+### 3. Create the systemd Service
 
 ```bash
 sudo nano /etc/systemd/system/birdnet_audio_bridge.service
@@ -80,13 +120,12 @@ see [birdnet_audio_bridge.service](birdnet_audio_bridge.service)
 
 **Filter chain explained:**
 
-| Filter                     | Purpose                                                             |
-|----------------------------|---------------------------------------------------------------------|
-| `volume=0.2`               | Reduce gain first to prevent clipping (ICS-43434 has a hot output)  |
-| `aresample=async=50000`    | Smooth over clock drift between ESP32 and Pi                        |
-| `highpass=f=100`           | Remove low-frequency wind/rumble noise                              |
-| `lowpass=f=11500`          | Cut I2S artifact line at ~11.5kHz (above all bird call frequencies) |
-| `pan=stereo\|c0=c0\|c1=c0` | Upmix mono to stereo (required by ALSA loopback)                    |
+| Filter                                | Purpose                                            |
+|---------------------------------------|----------------------------------------------------|
+| `aresample=48000:async=1:first_pts=0` | Upsample 24kHz→48kHz; fill silence during UDP gaps |
+| `volume=10`                           | Amplify quiet MEMS mic signal (tune to taste)      |
+| `highpass=f=100`                      | Remove low-frequency wind/rumble noise             |
+| `lowpass=f=11500`                     | Cut above bird call frequencies (Nyquist is 12kHz) |
 
 Enable and start:
 
@@ -99,7 +138,7 @@ sudo systemctl status birdnet_audio_bridge
 
 ---
 
-### 3. Configure BirdNET-Pi
+### 4. Configure BirdNET-Pi
 
 In the BirdNET-Pi web interface go to **Tools → Settings → Advanced Settings** and set:
 
@@ -115,6 +154,7 @@ Audio Card: plughw:CARD=Loopback,DEV=1
 
 ```bash
 sudo tcpdump -n udp port 5000 -c 5
+# Should show packets of ~1400 bytes (chunked to avoid IP fragmentation)
 ```
 
 **Check the loopback write side is active:**
@@ -148,13 +188,13 @@ journalctl -fu birdnet_audio_bridge.service
 
 ## Troubleshooting
 
-| Symptom                         | Cause                          | Fix                                                           |
-|---------------------------------|--------------------------------|---------------------------------------------------------------|
-| No UDP packets arriving         | ESP32 not sending / wrong IP   | Check `Audio Target IP` entity in Home Assistant              |
-| `state: closed` or `XRUN`       | No UDP data from ESP32         | Verify ESP32 is sending: `sudo tcpdump -n udp port 5000 -c 5` |
-| `state: OPEN` not `RUNNING`     | ffmpeg not writing to loopback | Check `systemctl status birdnet_audio_bridge`                 |
-| Black bars in spectrogram       | UDP packet loss / clock drift  | Increase `fifo_size` or `async` value                         |
-| Clipping warnings in logs       | Mic gain too high              | Decrease `volume=` value (try `0.1`)                          |
-| Weak or no detections           | Mic gain too low               | Increase `volume=` value (try `0.4`)                          |
-| `Device or resource busy`       | Another process has the device | Check `fuser /dev/snd/*`                                      |
-| `cannot set channel count to 1` | ALSA loopback requires stereo  | Ensure `pan=stereo` filter is last in chain                   |
+| Symptom                     | Cause                          | Fix                                                           |
+|-----------------------------|--------------------------------|---------------------------------------------------------------|
+| No UDP packets arriving     | ESP32 not sending / wrong IP   | Check `Audio Target IP` entity in Home Assistant              |
+| `state: closed` or `XRUN`   | No UDP data from ESP32         | Verify ESP32 is sending: `sudo tcpdump -n udp port 5000 -c 5` |
+| `state: OPEN` not `RUNNING` | ffmpeg not writing to loopback | Check `systemctl status birdnet_audio_bridge`                 |
+| Frequent XRUN in loopback   | Sample rate mismatch           | Verify `-ar` in service matches actual ESP32 output rate      |
+| Clicks/pops in spectrogram  | I2S DMA boundary artifacts     | Normal at low levels; shouldn't affect BirdNET detections     |
+| Clipping warnings in logs   | Volume too high                | Decrease `volume=` value                                      |
+| Weak or no detections       | Volume too low                 | Increase `volume=` value                                      |
+| `Device or resource busy`   | Another process has the device | Check `fuser /dev/snd/*`                                      |

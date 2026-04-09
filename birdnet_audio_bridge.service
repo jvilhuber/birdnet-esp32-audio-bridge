@@ -3,9 +3,9 @@ Description=ESP32 UDP Audio to ALSA Loopback
 After=network.target sound.target
 
 [Service]
-ExecStart=/usr/bin/ffmpeg -loglevel warning -f s16le -ar 48000 -ac 1 \
-  -i "udp://0.0.0.0:5000?overrun_nonfatal=1&fifo_size=5000000" \
-  -af "volume=0.2,aresample=async=50000,highpass=f=100,lowpass=f=11500,pan=stereo|c0=c0|c1=c0" \
+ExecStart=/usr/bin/ffmpeg -loglevel warning -f s32le -ar 24000 -ac 2 \
+  -i "udp://0.0.0.0:5000?overrun_nonfatal=1&fifo_size=5000000&buffer_size=65536" \
+  -af "pan=stereo|c0=c0|c1=c0,aresample=48000:async=1000:first_pts=0,volume=1,highpass=f=100,lowpass=f=11500" \
   -f alsa hw:Loopback,0
 Restart=always
 RestartSec=5
