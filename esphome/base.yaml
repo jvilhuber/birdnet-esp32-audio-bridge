@@ -5,7 +5,6 @@ substitutions:
   variant: esp32s3
   wifi_ssid: !secret wifi_ssid
   wifi_password: !secret wifi_password
-  ota_password: !secret ota_password
 
 esphome:
   name: ${device_name}
@@ -33,10 +32,6 @@ logger:
   logs:
     light: INFO
     sensor: INFO
-
-ota:
-  - platform: esphome
-    password: ${ota_password}
 
 wifi:
   ssid: ${wifi_ssid}
