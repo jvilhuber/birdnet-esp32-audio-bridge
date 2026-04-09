@@ -9,6 +9,6 @@ substitutions:
 packages:
   remote_package:
     url: https://github.com/jvilhuber/birdnet-esp32-audio-bridge
-    ref: main
+    ref: v1.0.0
     files:
       - esphome/base.yaml
