@@ -119,6 +119,7 @@ sudo tcpdump -n udp port 5000 -c 5
 ```bash
 cat /proc/asound/card0/pcm0p/sub0/status
 # Should show: state: RUNNING
+# If "closed" or "XRUN": ESP32 is likely not sending — check UDP packets first
 ```
 
 **Check BirdNET's recording service is consuming audio:**
@@ -147,6 +148,7 @@ journalctl -fu birdnet_audio_bridge.service
 | Symptom                         | Cause                          | Fix                                              |
 |---------------------------------|--------------------------------|--------------------------------------------------|
 | No UDP packets arriving         | ESP32 not sending / wrong IP   | Check `Audio Target IP` entity in Home Assistant |
+| `state: closed` or `XRUN`      | No UDP data from ESP32         | Verify ESP32 is sending: `sudo tcpdump -n udp port 5000 -c 5` |
 | `state: OPEN` not `RUNNING`     | ffmpeg not writing to loopback | Check `systemctl status birdnet_audio_bridge`    |
 | Black bars in spectrogram       | UDP packet loss / clock drift  | Increase `fifo_size` or `async` value            |
 | Clipping warnings in logs       | Mic gain too high              | Decrease `volume=` value (try `0.1`)             |
