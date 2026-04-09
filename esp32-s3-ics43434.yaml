@@ -28,12 +28,12 @@ logger:
 # Enable Home Assistant API
 api:
   encryption:
-    key: "Y6y+mGwX+3oj94LOEQ6Lp95eIlr7Vy7Qlv86W5dkoWo="
+    key: "<your encryption key>"
 
 # Allow Over-The-Air updates
 ota:
   - platform: esphome
-    password: "6fe5eff6f5fd67e468eff7e0d0ae2a66"
+    password: "<your ota password>"
 
 wifi:
   ssid: !secret wifi_ssid
