@@ -1,12 +1,21 @@
+substitutions:
+  device_name: "birdnet_audio_sensor"
+  friendly_name: "BirdNet Audio Sensor"
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  wifi_ssid: !secret wifi_ssid
+  wifi_password: !secret wifi_password
+  ota_password: !secret ota_password
+
 esphome:
-  name: esphome-dev-1
-  friendly_name: ESPHome Dev Device
+  name: ${device_name}
+  friendly_name: ${friendly_name}
   min_version: 2025.9.0
   name_add_mac_suffix: false
 
 esp32:
-  board: esp32-s3-devkitc-1
-  variant: esp32s3
+  board: ${board}
+  variant: ${variant}
   framework:
     type: esp-idf
     version: recommended
@@ -25,19 +34,13 @@ logger:
     light: INFO
     sensor: INFO
 
-# Enable Home Assistant API
-api:
-  encryption:
-    key: "<your encryption key>"
-
-# Allow Over-The-Air updates
 ota:
   - platform: esphome
-    password: "<your ota password>"
+    password: ${ota_password}
 
 wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
+  ssid: ${wifi_ssid}
+  password: ${wifi_password}
   power_save_mode: none
   on_connect:
     - logger.log: "WiFi connected!"
@@ -57,6 +60,10 @@ globals:
     type: int
     restore_value: true
     initial_value: '5000'
+  - id: mic_gain
+    type: int
+    restore_value: true
+    initial_value: '8'
 
 text:
   - platform: template
@@ -87,6 +94,23 @@ number:
     on_value:
       - globals.set:
           id: udp_target_port
+          value: !lambda 'return (int)x;'
+
+  - platform: template
+    name: "Mic Gain"
+    id: mic_gain_input
+    optimistic: true
+    restore_value: true
+    initial_value: 1
+    min_value: 1
+    max_value: 32
+    step: 1
+    mode: slider
+    entity_category: config
+    icon: "mdi:volume-high"
+    on_value:
+      - globals.set:
+          id: mic_gain
           value: !lambda 'return (int)x;'
 
 binary_sensor:
@@ -141,7 +165,7 @@ microphone:
     i2s_audio_id: i2s_in
     sample_rate: 48000
     bits_per_channel: 32bit
-    bits_per_sample: 32bit
+    bits_per_sample: 16bit
     channel: left
     pdm: false
     use_apll: true
@@ -151,6 +175,19 @@ microphone:
           static struct sockaddr_in dest = {};
           static std::string last_ip = "";
           static int last_port = -1;
+          static uint16_t rtp_seq = 0;
+          static uint32_t rtp_ts = 0;
+          static uint32_t ssrc = 0;
+          static bool initialized = false;
+          // Accumulator for samples across callbacks (handles non-aligned DMA chunks)
+          static int16_t mono_buf[4096];
+          static size_t mono_buf_len = 0;
+
+          if (!initialized) {
+            ssrc = esp_random();
+            rtp_seq = (uint16_t)(esp_random() & 0xFFFF);
+            initialized = true;
+          }
 
           // Guard: skip if IP is empty or unset
           std::string ip = id(udp_target_ip);
@@ -160,7 +197,7 @@ microphone:
 
           // Close and reopen socket if IP or port has changed
           if ((ip != last_ip || port != last_port) && sock >= 0) {
-            ESP_LOGI("udp", "Target changed from %s:%d to %s:%d, reopening socket",
+            ESP_LOGI("rtp", "Target changed from %s:%d to %s:%d, reopening socket",
                      last_ip.c_str(), last_port, ip.c_str(), port);
             ::close(sock);
             sock = -1;
@@ -170,13 +207,12 @@ microphone:
           if (sock < 0) {
             sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
             if (sock < 0) return;
-            int broadcast = 1;
-            ::setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
             int sndbuf = 65536;
             ::setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
             last_ip = ip;
             last_port = port;
-            ESP_LOGI("udp", "Opened UDP socket, sending to %s:%d", ip.c_str(), port);
+            ESP_LOGI("rtp", "Opened UDP socket, sending RTP to %s:%d (SSRC=0x%08X)",
+                     ip.c_str(), port, ssrc);
           }
 
           // Update destination
@@ -184,16 +220,51 @@ microphone:
           dest.sin_port = htons((uint16_t)port);
           if (::inet_pton(AF_INET, ip.c_str(), &dest.sin_addr) != 1) return;
 
-          // Send raw stereo data directly — no processing in this time-critical
-          // callback. Channel extraction is done by ffmpeg on the Pi.
-          // Split into chunks <= 1400 bytes to avoid IP fragmentation (MTU 1500).
-          const size_t MAX_CHUNK = 1400;
-          const uint8_t* ptr = x.data();
-          size_t remaining = x.size();
-          while (remaining > 0) {
-            size_t chunk = remaining < MAX_CHUNK ? remaining : MAX_CHUNK;
-            ::sendto(sock, ptr, chunk, MSG_DONTWAIT,
-                     (struct sockaddr*)&dest, sizeof(dest));
-            ptr += chunk;
-            remaining -= chunk;
+          // Extract mono (left channel) from interleaved stereo 16-bit samples
+          const int16_t *stereo = reinterpret_cast<const int16_t *>(x.data());
+          size_t total_stereo_samples = x.size() / sizeof(int16_t);
+          for (size_t i = 0; i < total_stereo_samples; i += 2) {
+            if (mono_buf_len < sizeof(mono_buf) / sizeof(mono_buf[0])) {
+              mono_buf[mono_buf_len++] = stereo[i];
+            }
+          }
+
+          // Send complete RTP packets: 12-byte header + 720 L16 samples (1440 bytes)
+          // 720 samples @ 24kHz = 30ms per packet, 1452 bytes total (under MTU 1500)
+          const size_t SAMPLES_PER_PACKET = 720;
+          uint8_t packet[12 + SAMPLES_PER_PACKET * 2];
+
+          while (mono_buf_len >= SAMPLES_PER_PACKET) {
+            // RTP header (RFC 3550)
+            packet[0] = 0x80;  // V=2, P=0, X=0, CC=0
+            packet[1] = 96;    // PT=96 (dynamic), M=0
+            packet[2] = (uint8_t)(rtp_seq >> 8);
+            packet[3] = (uint8_t)(rtp_seq & 0xFF);
+            uint32_t ts_n = htonl(rtp_ts);
+            memcpy(&packet[4], &ts_n, 4);
+            uint32_t ssrc_n = htonl(ssrc);
+            memcpy(&packet[8], &ssrc_n, 4);
+
+            // Payload: L16 big-endian mono samples with digital gain
+            int16_t *payload = reinterpret_cast<int16_t *>(&packet[12]);
+            const int GAIN = id(mic_gain);
+            for (size_t i = 0; i < SAMPLES_PER_PACKET; i++) {
+              int32_t amplified = (int32_t)mono_buf[i] * GAIN;
+              if (amplified > 32767) amplified = 32767;
+              else if (amplified < -32768) amplified = -32768;
+              payload[i] = (int16_t)__builtin_bswap16((uint16_t)(int16_t)amplified);
+            }
+
+            ::sendto(sock, packet, sizeof(packet), MSG_DONTWAIT,
+                     (struct sockaddr *)&dest, sizeof(dest));
+
+            rtp_seq++;
+            rtp_ts += SAMPLES_PER_PACKET;
+
+            // Shift remaining samples to front of accumulator
+            mono_buf_len -= SAMPLES_PER_PACKET;
+            if (mono_buf_len > 0) {
+              memmove(mono_buf, &mono_buf[SAMPLES_PER_PACKET],
+                      mono_buf_len * sizeof(int16_t));
+            }
           }

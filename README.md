@@ -1,7 +1,7 @@
 # ESP32 Microphone → BirdNET-Pi Audio Bridge
 
 Streams audio from a Waveshare ESP32-S3 Zero with an ICS-43434 I2S microphone to a headless Raspberry Pi running
-BirdNET-Pi, via raw UDP over the local network.
+BirdNET-Pi, via RTP over UDP on the local network.
 
 ---
 
@@ -11,19 +11,25 @@ BirdNET-Pi, via raw UDP over the local network.
 ICS-43434 mic
      │ I2S (32-bit slots, left channel, 24kHz effective)
 ESP32-S3 Zero
-     │ raw stereo PCM UDP (port 5000)
+     │ RTP/UDP mono L16 PCM (port 5000)
      ▼
 Raspberry Pi (BirdNET-Pi)
-  ffmpeg (24kHz→48kHz upsample) → ALSA Loopback → BirdNET-Pi recording service
+  ffmpeg (SDP → RTP demux → 24kHz→48kHz upsample) → ALSA Loopback → BirdNET-Pi
 ```
 
-**Audio format sent over UDP:** 16-bit signed PCM, little-endian, stereo, ~24 kHz.
+**Audio format sent over RTP:** L16 (16-bit signed PCM, big-endian, mono, 24 kHz)
+per RFC 3551, with standard 12-byte RTP headers (sequence numbers, timestamps, SSRC).
 
 The ICS-43434 outputs 24-bit data in the left slot of a standard stereo I2S frame
 (LR pin tied low). ESPHome's `on_data` callback delivers stereo interleaved 16-bit
-LE bytes (both channels identical). The raw stereo data is sent directly over UDP
-with no processing on the ESP32 to keep the I2S callback as fast as possible.
-ffmpeg on the Pi handles upsampling to 48 kHz for BirdNET.
+samples. The ESP32 extracts the left (mono) channel, applies configurable digital
+gain, byte-swaps to big-endian L16, and sends RTP packets of 720 samples (30ms)
+each. ffmpeg on the Pi reads the RTP stream via a static SDP file and upsamples to
+48 kHz for BirdNET.
+
+RTP sequence numbers let ffmpeg detect packet loss and insert silence instead of
+glitching. RTP timestamps enable jitter buffering for smooth playback. The stream
+is compatible with any RTP client (VLC, Wireshark, etc.).
 
 **Why 24 kHz?** The ICS-43434 requires 64 SCK cycles per WS frame (32-bit channel
 slots). Setting `bits_per_channel: 32bit` in ESPHome satisfies this requirement and
@@ -31,16 +37,13 @@ eliminates I2S framing clicks, but halves the effective sample rate from 48 kHz 
 24 kHz at the current SCK frequency. 24 kHz is sufficient for BirdNET — bird calls
 are well below the 12 kHz Nyquist limit.
 
-**Why stereo?** Extracting mono on the ESP32 adds processing time to the
-time-critical I2S DMA callback and can cause audio glitches. Sending raw stereo
-and letting ffmpeg handle it on the Pi (which has CPU to spare) produces cleaner
-audio. The bandwidth cost (~1.5 Mbps) is trivial for local WiFi.
-
 ---
 
 ## ESP32 ESPHome Configuration
 
-Key microphone settings: see [esp32-s3-ics43434.yaml](esp32-s3-ics43434.yaml)
+Key microphone settings: see [esphome/base.yaml](esphome/base.yaml)
+
+Per-device overrides (board, pins, secrets): see [esphome/esp32-s3-ics43434.yaml](esphome/esp32-s3-ics43434.yaml)
 
 **Pins:**
 
@@ -52,22 +55,30 @@ Key microphone settings: see [esp32-s3-ics43434.yaml](esp32-s3-ics43434.yaml)
 
 **Key I2S settings:**
 
-| Setting            | Value | Why                                                        |
-|--------------------|-------|------------------------------------------------------------|
-| `sample_rate`      | 48000 | ESPHome I2S clock base rate                                |
-| `bits_per_channel` | 32bit | Matches ICS-43434 requirement of 64 SCK/frame              |
-| `bits_per_sample`  | 16bit | Truncates 24-bit mic data to 16-bit (sufficient for birds) |
-| `channel`          | left  | ICS-43434 LR pin tied low                                  |
-| `use_apll`         | true  | Audio PLL for accurate clock generation                    |
-| `power_save_mode`  | none  | Disables WiFi power save to reduce UDP jitter              |
+| Setting            | Value | Why                                                         |
+|--------------------|-------|-------------------------------------------------------------|
+| `sample_rate`      | 48000 | ESPHome I2S clock base rate                                 |
+| `bits_per_channel` | 32bit | Matches ICS-43434 requirement of 64 SCK/frame               |
+| `bits_per_sample`  | 16bit | Truncates 24-bit mic data to 16-bit; matches RTP L16 format |
+| `channel`          | left  | ICS-43434 LR pin tied low                                   |
+| `use_apll`         | true  | Audio PLL for accurate clock generation                     |
+| `power_save_mode`  | none  | Disables WiFi power save to reduce UDP jitter               |
 
-The UDP target IP and port are configurable at runtime via Home Assistant
-(`Audio Target IP` and `UDP Target Port` entities). The microphone starts
-and stops automatically with WiFi connection state.
+The following are configurable at runtime via Home Assistant entities
+(changes take effect immediately, no reflash needed):
 
-UDP packets are split into chunks of 1400 bytes or less to avoid IP
-fragmentation (MTU 1500). `MSG_DONTWAIT` is used on `sendto()` to prevent
-the WiFi TX buffer from blocking the I2S callback.
+| Entity            | Default | Description                                    |
+|-------------------|---------|------------------------------------------------|
+| `Audio Target IP` | (empty) | IP address to send RTP packets to              |
+| `UDP Target Port` | 5000    | UDP port for RTP stream                        |
+| `Mic Gain`        | 1       | Digital gain multiplier (1–32); 8 ≈ 18dB boost |
+
+The microphone starts and stops automatically with WiFi connection state.
+
+Each RTP packet contains 720 mono samples (30ms of audio) with a 12-byte
+RTP header, totalling 1452 bytes — well under the 1500-byte MTU.
+`MSG_DONTWAIT` is used on `sendto()` to prevent the WiFi TX buffer from
+blocking the I2S callback.
 
 ---
 
@@ -110,22 +121,40 @@ sudo iwconfig wlan0 power off
 
 ---
 
-### 3. Create the systemd Service
+### 3. Deploy the SDP File
+
+The SDP file tells ffmpeg the format of the RTP stream. Copy it to the Pi:
+
+```bash
+sudo mkdir -p /opt/birdnet-audio-bridge
+sudo cp stream.sdp /opt/birdnet-audio-bridge/stream.sdp
+```
+
+If the ESP32 sends to a specific unicast IP, edit the `c=` line in
+`stream.sdp` to match the ESP32's IP. If using broadcast or if unsure,
+leave it as `0.0.0.0` to accept from any source.
+
+---
+
+### 4. Create the systemd Service
 
 ```bash
 sudo nano /etc/systemd/system/birdnet_audio_bridge.service
 ```
 
-see [birdnet_audio_bridge.service](birdnet_audio_bridge.service)
+see [birdnetpi/birdnet_audio_bridge.service](birdnetpi/birdnet_audio_bridge.service)
+
+ffmpeg reads the RTP stream described by the SDP file. RTP sequence numbers
+and timestamps enable automatic jitter buffering and packet loss detection.
 
 **Filter chain explained:**
 
-| Filter                                | Purpose                                            |
-|---------------------------------------|----------------------------------------------------|
-| `aresample=48000:async=1:first_pts=0` | Upsample 24kHz→48kHz; fill silence during UDP gaps |
-| `volume=10`                           | Amplify quiet MEMS mic signal (tune to taste)      |
-| `highpass=f=100`                      | Remove low-frequency wind/rumble noise             |
-| `lowpass=f=11500`                     | Cut above bird call frequencies (Nyquist is 12kHz) |
+| Filter                                   | Purpose                                             |
+|------------------------------------------|-----------------------------------------------------|
+| `aresample=48000:async=1000:first_pts=0` | Upsample 24kHz→48kHz; insert silence on packet loss |
+| `volume=10`                              | Amplify MEMS mic signal (tune to taste)             |
+| `highpass=f=100`                         | Remove low-frequency wind/rumble noise              |
+| `lowpass=f=11500`                        | Cut above bird call frequencies (Nyquist is 12kHz)  |
 
 Enable and start:
 
@@ -138,7 +167,7 @@ sudo systemctl status birdnet_audio_bridge
 
 ---
 
-### 4. Configure BirdNET-Pi
+### 5. Configure BirdNET-Pi
 
 In the BirdNET-Pi web interface go to **Tools → Settings → Advanced Settings** and set:
 
@@ -150,11 +179,24 @@ Audio Card: plughw:CARD=Loopback,DEV=1
 
 ## Verification
 
-**Check UDP packets are arriving from the ESP32:**
+**Check RTP packets are arriving from the ESP32:**
 
 ```bash
 sudo tcpdump -n udp port 5000 -c 5
-# Should show packets of ~1400 bytes (chunked to avoid IP fragmentation)
+# Should show packets of ~1452 bytes (12-byte RTP header + 1440-byte payload)
+```
+
+**Verify the RTP stream with ffmpeg:**
+
+```bash
+ffmpeg -protocol_whitelist file,udp,rtp -i /opt/birdnet-audio-bridge/stream.sdp -f null - 2>&1 | head -20
+# Should show: Stream #0:0: Audio: pcm_s16be, 24000 Hz, mono
+```
+
+**Play the stream in VLC (optional, from any machine on the network):**
+
+```bash
+vlc rtp://@:5000
 ```
 
 **Check the loopback write side is active:**
@@ -190,11 +232,11 @@ journalctl -fu birdnet_audio_bridge.service
 
 | Symptom                     | Cause                          | Fix                                                           |
 |-----------------------------|--------------------------------|---------------------------------------------------------------|
-| No UDP packets arriving     | ESP32 not sending / wrong IP   | Check `Audio Target IP` entity in Home Assistant              |
-| `state: closed` or `XRUN`   | No UDP data from ESP32         | Verify ESP32 is sending: `sudo tcpdump -n udp port 5000 -c 5` |
+| No RTP packets arriving     | ESP32 not sending / wrong IP   | Check `Audio Target IP` entity in Home Assistant              |
+| `state: closed` or `XRUN`   | No RTP data from ESP32         | Verify ESP32 is sending: `sudo tcpdump -n udp port 5000 -c 5` |
 | `state: OPEN` not `RUNNING` | ffmpeg not writing to loopback | Check `systemctl status birdnet_audio_bridge`                 |
-| Frequent XRUN in loopback   | Sample rate mismatch           | Verify `-ar` in service matches actual ESP32 output rate      |
-| Clicks/pops in spectrogram  | I2S DMA boundary artifacts     | Normal at low levels; shouldn't affect BirdNET detections     |
-| Clipping warnings in logs   | Volume too high                | Decrease `volume=` value                                      |
-| Weak or no detections       | Volume too low                 | Increase `volume=` value                                      |
+| Frequent XRUN in loopback   | Sample rate mismatch           | Verify SDP `a=rtpmap` rate matches ESP32 output rate          |
+| Clicks/pops in spectrogram  | Packet loss (WiFi congestion)  | Check `journalctl` for loss warnings; move ESP32 closer to AP |
+| Clipping warnings in logs   | Volume/gain too high           | Lower `Mic Gain` in HA or `volume=` in ffmpeg                 |
+| Weak or no detections       | Volume/gain too low            | Raise `Mic Gain` in HA or `volume=` in ffmpeg                 |
 | `Device or resource busy`   | Another process has the device | Check `fuser /dev/snd/*`                                      |
