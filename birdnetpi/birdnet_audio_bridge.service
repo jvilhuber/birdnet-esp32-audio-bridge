@@ -3,13 +3,7 @@ Description=ESP32 UDP Audio to ALSA Loopback
 After=network.target sound.target
 
 [Service]
-ExecStart=/bin/bash -c '/usr/bin/ffmpeg -loglevel warning \
-  -fflags +nobuffer -analyzeduration 0 -probesize 32 \
-  -protocol_whitelist file,udp,rtp -max_delay 5000000 \
-  -i /opt/birdnet-audio-bridge/stream.sdp \
-  -af "aresample=48000:async=1000:first_pts=0,volume=10,highpass=f=100,lowpass=f=11500" \
-  -ac 2 -f s16le pipe:1 | \
-  aplay -D hw:Loopback,0 -f S16_LE -r 48000 -c 2 --buffer-size=65536'
+ExecStart=/opt/birdnet-audio-bridge/birdnet_audio_bridge.sh
 Restart=always
 RestartSec=5
 User=jan
