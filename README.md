@@ -121,40 +121,49 @@ sudo iwconfig wlan0 power off
 
 ---
 
-### 3. Deploy the SDP File
+### 3. Deploy the Bridge Files
 
-The SDP file tells ffmpeg the format of the RTP stream. Copy it to the Pi:
+Copy the SDP file and wrapper script to the Pi:
 
 ```bash
 sudo mkdir -p /opt/birdnet-audio-bridge
-sudo cp stream.sdp /opt/birdnet-audio-bridge/stream.sdp
+sudo cp birdnetpi/stream.sdp /opt/birdnet-audio-bridge/stream.sdp
+sudo cp birdnetpi/birdnet_audio_bridge.sh /opt/birdnet-audio-bridge/birdnet_audio_bridge.sh
+sudo chmod +x /opt/birdnet-audio-bridge/birdnet_audio_bridge.sh
 ```
 
-If the ESP32 sends to a specific unicast IP, edit the `c=` line in
-`stream.sdp` to match the ESP32's IP. If using broadcast or if unsure,
-leave it as `0.0.0.0` to accept from any source.
+The SDP file tells ffmpeg the format of the RTP stream. If the ESP32
+sends to a specific unicast IP, edit the `c=` line in `stream.sdp` to
+match the ESP32's IP. If using broadcast or if unsure, leave it as
+`0.0.0.0` to accept from any source.
+
+The wrapper script drains any stale UDP packets queued before starting
+ffmpeg (prevents an initial RTP buffer overflow) and then runs the
+ffmpeg→ALSA pipeline.
 
 ---
 
 ### 4. Create the systemd Service
 
 ```bash
-sudo nano /etc/systemd/system/birdnet_audio_bridge.service
+sudo cp birdnetpi/birdnet_audio_bridge.service /etc/systemd/system/birdnet_audio_bridge.service
 ```
 
-see [birdnetpi/birdnet_audio_bridge.service](birdnetpi/birdnet_audio_bridge.service)
-
-ffmpeg reads the RTP stream described by the SDP file. RTP sequence numbers
-and timestamps enable automatic jitter buffering and packet loss detection.
+See [birdnetpi/birdnet_audio_bridge.service](birdnetpi/birdnet_audio_bridge.service).
+The service runs the wrapper script, which handles UDP drain and the ffmpeg pipeline.
 
 **Filter chain explained:**
 
-| Filter                                   | Purpose                                             |
-|------------------------------------------|-----------------------------------------------------|
-| `aresample=48000:async=1000:first_pts=0` | Upsample 24kHz→48kHz; insert silence on packet loss |
-| `volume=10`                              | Amplify MEMS mic signal (tune to taste)             |
-| `highpass=f=100`                         | Remove low-frequency wind/rumble noise              |
-| `lowpass=f=11500`                        | Cut above bird call frequencies (Nyquist is 12kHz)  |
+| Filter                                   | Purpose                                              |
+|------------------------------------------|------------------------------------------------------|
+| `aresample=48000:async=1000:first_pts=0` | Upsample 24kHz→48kHz; insert silence on packet loss  |
+| `volume=1`                               | Unity gain (adjust ESP32 `Mic Gain` via HA instead)  |
+| `highpass=f=100`                         | Remove low-frequency wind/rumble noise               |
+| `lowpass=f=11500`                        | Cut above bird call frequencies (Nyquist is 12kHz)   |
+| `afftdn=nf=-25`                         | FFT-based noise reduction (removes background hiss)  |
+
+The output goes to `plughw:Loopback,0`, which handles automatic sample format
+conversion to match the loopback device.
 
 Enable and start:
 
@@ -230,13 +239,15 @@ journalctl -fu birdnet_audio_bridge.service
 
 ## Troubleshooting
 
-| Symptom                     | Cause                          | Fix                                                           |
-|-----------------------------|--------------------------------|---------------------------------------------------------------|
-| No RTP packets arriving     | ESP32 not sending / wrong IP   | Check `Audio Target IP` entity in Home Assistant              |
+| Symptom                      | Cause                           | Fix                                                            |
+|------------------------------|--------------------------------|----------------------------------------------------------------|
+| No RTP packets arriving      | ESP32 not sending / wrong IP   | Check `Audio Target IP` entity in Home Assistant               |
 | `state: closed` or `XRUN`   | No RTP data from ESP32         | Verify ESP32 is sending: `sudo tcpdump -n udp port 5000 -c 5` |
-| `state: OPEN` not `RUNNING` | ffmpeg not writing to loopback | Check `systemctl status birdnet_audio_bridge`                 |
-| Frequent XRUN in loopback   | Sample rate mismatch           | Verify SDP `a=rtpmap` rate matches ESP32 output rate          |
-| Clicks/pops in spectrogram  | Packet loss (WiFi congestion)  | Check `journalctl` for loss warnings; move ESP32 closer to AP |
-| Clipping warnings in logs   | Volume/gain too high           | Lower `Mic Gain` in HA or `volume=` in ffmpeg                 |
-| Weak or no detections       | Volume/gain too low            | Raise `Mic Gain` in HA or `volume=` in ffmpeg                 |
-| `Device or resource busy`   | Another process has the device | Check `fuser /dev/snd/*`                                      |
+| `state: OPEN` not `RUNNING`  | ffmpeg not writing to loopback | Check `systemctl status birdnet_audio_bridge`                  |
+| Frequent XRUN in loopback    | Sample rate mismatch           | Verify SDP `a=rtpmap` rate matches ESP32 output rate           |
+| Clicks/pops in spectrogram   | Packet loss (WiFi congestion)  | Check WiFi signal (`WiFi Signal dB` entity in HA); move closer |
+| `max delay reached` in logs  | Network jitter / packet burst  | Check WiFi signal strength; disable WiFi power save on both sides |
+| Clipping warnings in logs    | Volume/gain too high           | Lower `Mic Gain` in HA (changes take effect immediately)       |
+| Weak or no detections        | Volume/gain too low            | Raise `Mic Gain` in HA (changes take effect immediately)       |
+| XRUN on service startup only | Normal; stale packets drained  | One-time xrun at startup is expected and harmless              |
+| `Device or resource busy`    | Another process has the device | Check `fuser /dev/snd/*`                                       |
