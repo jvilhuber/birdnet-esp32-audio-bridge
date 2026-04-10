@@ -1,0 +1,24 @@
+name: Validate ESPHome Config
+
+on:
+  push:
+    paths:
+      - 'esphome/**'
+  pull_request:
+    paths:
+      - 'esphome/**'
+
+jobs:
+  check-no-secrets:
+    name: Check base.yaml has no !secret references
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject !secret in remote-package files
+        run: |
+          if grep -n '!secret' esphome/base.yaml; then
+            echo "::error::esphome/base.yaml contains !secret references. Remote packages cannot resolve secrets from the consuming device. Use substitution defaults instead."
+            exit 1
+          fi
+          echo "No !secret references found in base.yaml"
