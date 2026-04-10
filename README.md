@@ -44,6 +44,8 @@ are well below the 12 kHz Nyquist limit.
 Key microphone settings: see [esphome/base.yaml](esphome/base.yaml)
 
 Per-device overrides (board, pins, secrets): see [esphome/esp32-s3-ics43434.yaml](esphome/esp32-s3-ics43434.yaml)
+(example device YAML — copy and adjust for your own board/secrets). This file
+references `base.yaml` via `packages:` with a pinned git tag.
 
 **Pins:**
 
@@ -62,7 +64,12 @@ Per-device overrides (board, pins, secrets): see [esphome/esp32-s3-ics43434.yaml
 | `bits_per_sample`  | 16bit | Truncates 24-bit mic data to 16-bit; matches RTP L16 format |
 | `channel`          | left  | ICS-43434 LR pin tied low                                   |
 | `use_apll`         | true  | Audio PLL for accurate clock generation                     |
-| `power_save_mode`  | none  | Disables WiFi power save to reduce UDP jitter               |
+
+**WiFi settings:**
+
+| Setting           | Value | Why                                           |
+|-------------------|-------|-----------------------------------------------|
+| `power_save_mode` | none  | Disables WiFi power save to reduce UDP jitter |
 
 The following are configurable at runtime via Home Assistant entities
 (changes take effect immediately, no reflash needed):
@@ -143,7 +150,7 @@ ffmpeg→ALSA pipeline.
 
 ---
 
-### 4. Create the systemd Service
+### 4. Install the systemd Service
 
 ```bash
 sudo cp birdnetpi/birdnet_audio_bridge.service /etc/systemd/system/birdnet_audio_bridge.service
@@ -154,13 +161,13 @@ The service runs the wrapper script, which handles UDP drain and the ffmpeg pipe
 
 **Filter chain explained:**
 
-| Filter                                   | Purpose                                              |
-|------------------------------------------|------------------------------------------------------|
-| `aresample=48000:async=1000:first_pts=0` | Upsample 24kHz→48kHz; insert silence on packet loss  |
-| `volume=1`                               | Unity gain (adjust ESP32 `Mic Gain` via HA instead)  |
-| `highpass=f=100`                         | Remove low-frequency wind/rumble noise               |
-| `lowpass=f=11500`                        | Cut above bird call frequencies (Nyquist is 12kHz)   |
-| `afftdn=nf=-25`                         | FFT-based noise reduction (removes background hiss)  |
+| Filter                                   | Purpose                                             |
+|------------------------------------------|-----------------------------------------------------|
+| `aresample=48000:async=1000:first_pts=0` | Upsample 24kHz→48kHz; insert silence on packet loss |
+| `volume=1`                               | Unity gain (adjust ESP32 `Mic Gain` via HA instead) |
+| `highpass=f=100`                         | Remove low-frequency wind/rumble noise              |
+| `lowpass=f=11500`                        | Cut above bird call frequencies (Nyquist is 12kHz)  |
+| `afftdn=nf=-25`                          | FFT-based noise reduction (removes background hiss) |
 
 The output goes to `plughw:Loopback,0`, which handles automatic sample format
 conversion to match the loopback device.
@@ -239,15 +246,15 @@ journalctl -fu birdnet_audio_bridge.service
 
 ## Troubleshooting
 
-| Symptom                      | Cause                           | Fix                                                            |
-|------------------------------|--------------------------------|----------------------------------------------------------------|
-| No RTP packets arriving      | ESP32 not sending / wrong IP   | Check `Audio Target IP` entity in Home Assistant               |
-| `state: closed` or `XRUN`   | No RTP data from ESP32         | Verify ESP32 is sending: `sudo tcpdump -n udp port 5000 -c 5` |
-| `state: OPEN` not `RUNNING`  | ffmpeg not writing to loopback | Check `systemctl status birdnet_audio_bridge`                  |
-| Frequent XRUN in loopback    | Sample rate mismatch           | Verify SDP `a=rtpmap` rate matches ESP32 output rate           |
-| Clicks/pops in spectrogram   | Packet loss (WiFi congestion)  | Check WiFi signal (`WiFi Signal dB` entity in HA); move closer |
+| Symptom                      | Cause                          | Fix                                                               |
+|------------------------------|--------------------------------|-------------------------------------------------------------------|
+| No RTP packets arriving      | ESP32 not sending / wrong IP   | Check `Audio Target IP` entity in Home Assistant                  |
+| `state: closed` or `XRUN`    | No RTP data from ESP32         | Verify ESP32 is sending: `sudo tcpdump -n udp port 5000 -c 5`     |
+| `state: OPEN` not `RUNNING`  | ffmpeg not writing to loopback | Check `systemctl status birdnet_audio_bridge`                     |
+| Frequent XRUN in loopback    | Sample rate mismatch           | Verify SDP `a=rtpmap` rate matches ESP32 output rate              |
+| Clicks/pops in spectrogram   | Packet loss (WiFi congestion)  | Check WiFi signal (`WiFi Signal dB` entity in HA); move closer    |
 | `max delay reached` in logs  | Network jitter / packet burst  | Check WiFi signal strength; disable WiFi power save on both sides |
-| Clipping warnings in logs    | Volume/gain too high           | Lower `Mic Gain` in HA (changes take effect immediately)       |
-| Weak or no detections        | Volume/gain too low            | Raise `Mic Gain` in HA (changes take effect immediately)       |
-| XRUN on service startup only | Normal; stale packets drained  | One-time xrun at startup is expected and harmless              |
-| `Device or resource busy`    | Another process has the device | Check `fuser /dev/snd/*`                                       |
+| Clipping warnings in logs    | Volume/gain too high           | Lower `Mic Gain` in HA (changes take effect immediately)          |
+| Weak or no detections        | Volume/gain too low            | Raise `Mic Gain` in HA (changes take effect immediately)          |
+| XRUN on service startup only | Normal; stale packets drained  | One-time xrun at startup is expected and harmless                 |
+| `Device or resource busy`    | Another process has the device | Check `fuser /dev/snd/*`                                          |
